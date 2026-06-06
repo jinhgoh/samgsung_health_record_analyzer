@@ -4,11 +4,11 @@ A Streamlit dashboard for Samsung Health CSV exports from Android. It supports t
 
 ## Dependencies
 
-* **Runtime:** [Python](https://www.python.org) (v3.9 or higher)
-* **Web framework:** [Streamlit](https://streamlit.io)
-* **Data & numerics:** [pandas](https://pandas.pydata.org) and [NumPy](https://numpy.org)
-* **Charts:** [Plotly](https://plotly.com/python/)
-* **Package Manager:** pip (comes bundled with Python)
+![Python](https://img.shields.io/badge/Python-3.9%2B-3776AB?style=flat-square&logo=python&logoColor=white)
+![Streamlit](https://img.shields.io/badge/Streamlit-1.58.0-FF4B4B?style=flat-square&logo=streamlit&logoColor=white)
+![pandas](https://img.shields.io/badge/pandas-3.0.3-150458?style=flat-square&logo=pandas&logoColor=white)
+![NumPy](https://img.shields.io/badge/NumPy-2.4.6-013243?style=flat-square&logo=numpy&logoColor=white)
+![Plotly](https://img.shields.io/badge/Plotly-6.8.0-3F4F75?style=flat-square&logo=plotly&logoColor=white)
 
 ## Run
 
