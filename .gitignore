@@ -35,3 +35,4 @@ Thumbs.db
 *.swo
 .vscode/
 .idea/
+.claude/

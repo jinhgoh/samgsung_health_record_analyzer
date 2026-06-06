@@ -2,6 +2,14 @@
 
 A Streamlit dashboard for Samsung Health CSV exports from Android. It supports the two-line Samsung CSV format used by the bundled `sample_dataset` files, where the first row contains metadata and the second row contains real column headers.
 
+## Dependencies
+
+* **Runtime:** [Python](https://www.python.org) (v3.9 or higher)
+* **Web framework:** [Streamlit](https://streamlit.io)
+* **Data & numerics:** [pandas](https://pandas.pydata.org) and [NumPy](https://numpy.org)
+* **Charts:** [Plotly](https://plotly.com/python/)
+* **Package Manager:** pip (comes bundled with Python)
+
 ## Run
 
 ```powershell
