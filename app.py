@@ -12,6 +12,7 @@ from samsung_health_parser import (
     SLEEP_STAGE_ORDER,
     available_body_metrics,
     combine_frames,
+    daily_sleep_summary,
     load_health_csv,
     metric_label,
     prepare_body_records,
@@ -19,6 +20,9 @@ from samsung_health_parser import (
     prepare_sleep_stages,
     summarize_sleep_sessions,
     time_weighted_mean,
+    trailing_rate_per_day,
+    weight_band_durations,
+    weight_range_by_period,
 )
 
 
@@ -182,6 +186,46 @@ def time_axis_title(grain: str) -> str:
     return "Date"
 
 
+def date_window_slider(dates: pd.Series, key: str, label: str = "Date range"):
+    """Render a start-end date slider spanning the data's dates.
+
+    Returns the chosen ``(start, end)`` dates, or ``None`` when there are no
+    usable dates so callers skip filtering. With a single date it returns that
+    day without rendering a slider.
+    """
+    valid = pd.to_datetime(dates, errors="coerce").dropna()
+    if valid.empty:
+        return None
+    min_date = valid.min().date()
+    max_date = valid.max().date()
+    if min_date == max_date:
+        return (min_date, max_date)
+    return st.slider(
+        label,
+        min_value=min_date,
+        max_value=max_date,
+        value=(min_date, max_date),
+        format="YYYY-MM-DD",
+        key=key,
+        help="Filters the time-series charts in this tab to the selected dates.",
+    )
+
+
+def filter_by_date(frame: pd.DataFrame, column: str, window) -> pd.DataFrame:
+    """Keep rows whose ``column`` timestamp falls within the inclusive ``window``.
+
+    ``window`` is a ``(start, end)`` pair of dates. A no-op when ``window`` is
+    ``None`` or ``column`` is missing, so unfiltered call sites stay unchanged.
+    """
+    if window is None or frame.empty or column not in frame.columns:
+        return frame
+    start, end = window
+    times = pd.to_datetime(frame[column], errors="coerce")
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end) + pd.Timedelta(days=1)
+    return frame[times.notna() & (times >= start_ts) & (times < end_ts)]
+
+
 def render_record_summary(records) -> None:
     summary = pd.DataFrame(
         [
@@ -250,7 +294,7 @@ def render_sleep_timeline(sleep: pd.DataFrame) -> None:
     st.plotly_chart(fig, width="stretch")
 
 
-def render_sleep_records(sleep_records: pd.DataFrame) -> None:
+def render_sleep_records(sleep_records: pd.DataFrame, date_window=None) -> None:
     session_count = len(sleep_records)
     total_recorded = sleep_records["duration_min"].sum()
     average_session = total_recorded / session_count if session_count else 0
@@ -274,8 +318,9 @@ def render_sleep_records(sleep_records: pd.DataFrame) -> None:
     else:
         time_grain = "Session"
 
+    chart_source = filter_by_date(sleep_records, "start_dt", date_window)
     if has_start_time and time_grain != "Session":
-        chart_data = sleep_records.dropna(subset=["start_dt"]).copy()
+        chart_data = chart_source.dropna(subset=["start_dt"]).copy()
         chart_data["time_bucket"] = time_bucket(chart_data["start_dt"], time_grain)
         chart_data = (
             chart_data.groupby("time_bucket", as_index=False)["duration_min"]
@@ -287,13 +332,13 @@ def render_sleep_records(sleep_records: pd.DataFrame) -> None:
         x_title = time_axis_title(time_grain)
         hovertemplate = f"{time_axis_title(time_grain)}: %{{x|%Y-%m-%d}}<br>Total sleep: %{{y:.1f}} min<extra></extra>"
     elif has_start_time:
-        chart_data = sleep_records.dropna(subset=["start_dt"]).sort_values(["start_dt", "session_number"])
+        chart_data = chart_source.dropna(subset=["start_dt"]).sort_values(["start_dt", "session_number"])
         chart_x = chart_data["start_dt"]
         chart_y = chart_data["duration_min"]
         x_title = "Session start"
         hovertemplate = "Start: %{x|%Y-%m-%d %H:%M}<br>Duration: %{y:.1f} min<extra></extra>"
     else:
-        chart_data = sleep_records
+        chart_data = chart_source
         chart_x = chart_data["session_label"]
         chart_y = chart_data["duration_min"]
         x_title = "Session"
@@ -342,6 +387,100 @@ def render_sleep_records(sleep_records: pd.DataFrame) -> None:
     st.dataframe(display, width="stretch", hide_index=True)
 
 
+def _clock_hours(times: pd.Series) -> pd.Series:
+    """Hour-of-day on a noon-anchored 12:00->12:00 scale.
+
+    A night's sleep-in (late evening) and wake-up (next morning) sit on opposite
+    sides of midnight, so plotting raw hour-of-day makes the line jump between ~23
+    and ~1. Mapping after-midnight times to 24-36 keeps each night continuous.
+    """
+    hours = times.dt.hour + times.dt.minute / 60
+    return hours.where(hours >= 12, hours + 24)
+
+
+def render_daily_sleep(daily: pd.DataFrame) -> None:
+    st.subheader("Daily Sleep")
+
+    dated = daily[daily["sleep_in_dt"].notna()]
+    if len(dated) >= 2:
+        x = dated["sleep_in_dt"].dt.normalize()
+        sleep_in_hours = _clock_hours(dated["sleep_in_dt"])
+        wake_up_hours = _clock_hours(dated["wake_up_dt"])
+
+        low_hour = int(min(sleep_in_hours.min(), wake_up_hours.min()))
+        high_hour = int(max(sleep_in_hours.max(), wake_up_hours.max())) + 1
+        step = 2 if high_hour - low_hour > 12 else 1
+        tickvals = list(range(low_hour, high_hour + 1, step))
+        ticktext = [f"{value % 24:02d}:00" for value in tickvals]
+
+        fig = go.Figure()
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=sleep_in_hours,
+                name="Sleep-in",
+                mode="lines",
+                line=dict(color="#6366f1", width=2),
+                customdata=dated["sleep_in"],
+                hovertemplate="Sleep-in: %{customdata}<extra></extra>",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=wake_up_hours,
+                name="Wake-up",
+                mode="lines",
+                line=dict(color="#f59e0b", width=2),
+                customdata=dated["wake_up"],
+                hovertemplate="Wake-up: %{customdata}<extra></extra>",
+            )
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=x,
+                y=dated["sleep_minutes"] / 60,
+                name="Sleep hours",
+                mode="lines",
+                line=dict(color="#10b981", width=2, dash="dot"),
+                yaxis="y2",
+                hovertemplate="Sleep: %{y:.1f} h<extra></extra>",
+            )
+        )
+        fig.update_layout(
+            height=360,
+            margin=dict(l=12, r=12, t=10, b=42),
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+            xaxis=dict(title="Date", type="date"),
+            yaxis=dict(title="Clock time", tickmode="array", tickvals=tickvals, ticktext=ticktext),
+            yaxis2=dict(
+                title="Sleep hours",
+                overlaying="y",
+                side="right",
+                rangemode="tozero",
+                showgrid=False,
+            ),
+        )
+        apply_chart_theme(fig)
+        st.plotly_chart(fig, width="stretch")
+
+    table = pd.DataFrame(
+        {
+            "Date": daily["date"].dt.strftime("%Y-%m-%d").fillna("—"),
+            "Sleep-in time": daily["sleep_in"].replace("", "—"),
+            "Wake-up time": daily["wake_up"].replace("", "—"),
+            "Sleep hours": daily["sleep_minutes"].map(format_minutes),
+        }
+    )
+    st.dataframe(table, width="stretch", hide_index=True)
+    if not daily["has_clock_time"].any():
+        st.caption(
+            "Sleep-in and wake-up clock times need absolute timestamps in the sleep export. "
+            "This data only has elapsed-time fragments, so only sleep length is shown."
+        )
+
+
 def render_sleep_tab(sleep: pd.DataFrame, sleep_records: pd.DataFrame, loaded_sleep_records) -> None:
     if sleep.empty and sleep_records.empty:
         if loaded_sleep_records:
@@ -350,6 +489,16 @@ def render_sleep_tab(sleep: pd.DataFrame, sleep_records: pd.DataFrame, loaded_sl
         else:
             st.info("No sleep records were loaded.")
         return
+
+    date_parts = []
+    if not sleep.empty and "start_dt" in sleep.columns:
+        date_parts.append(sleep["start_dt"])
+    if not sleep_records.empty and "start_dt" in sleep_records.columns:
+        date_parts.append(sleep_records["start_dt"])
+    date_window = date_window_slider(
+        pd.concat(date_parts) if date_parts else pd.Series(dtype="datetime64[ns]"),
+        key="sleep_date_window",
+    )
 
     if not sleep.empty:
         session_summary = summarize_sleep_sessions(sleep)
@@ -363,6 +512,15 @@ def render_sleep_tab(sleep: pd.DataFrame, sleep_records: pd.DataFrame, loaded_sl
         metric_columns[1].metric("Recorded sleep", format_minutes(total_recorded))
         metric_columns[2].metric("Asleep time", format_minutes(asleep))
         metric_columns[3].metric("Deep + REM", f"{deep_pct + rem_pct:.1f}%")
+
+        all_daily = daily_sleep_summary(sleep)
+        daily = filter_by_date(all_daily, "sleep_in_dt", date_window)
+        if not daily.empty:
+            render_daily_sleep(daily)
+            st.divider()
+        elif not all_daily.empty:
+            st.info("No sleep sessions fall in the selected date range.")
+            st.divider()
 
         sessions = session_summary["Session"].tolist()
         selected = st.multiselect("Sessions", sessions, default=sessions[: min(8, len(sessions))])
@@ -407,7 +565,7 @@ def render_sleep_tab(sleep: pd.DataFrame, sleep_records: pd.DataFrame, loaded_sl
     if not sleep_records.empty:
         if not sleep.empty:
             st.divider()
-        render_sleep_records(sleep_records)
+        render_sleep_records(sleep_records, date_window)
 
 
 def render_body_tab(body: pd.DataFrame) -> None:
@@ -434,6 +592,12 @@ def render_body_tab(body: pd.DataFrame) -> None:
     metric_columns[1].metric("Latest BMI", f"{latest_bmi:.1f}" if latest_bmi else "-")
     metric_columns[2].metric("Latest body fat", f"{latest_body_fat:.1f}%" if latest_body_fat else "-")
     metric_columns[3].metric("Latest body water", f"{latest_water:.1f} kg" if latest_water else "-")
+
+    body_window = (
+        date_window_slider(body["record_dt"], key="body_date_window")
+        if has_usable_time(body, "record_dt")
+        else None
+    )
 
     if "weight" in body.columns and body["weight"].notna().any():
         weighted = body[body["weight"].notna()]
@@ -464,6 +628,238 @@ def render_body_tab(body: pd.DataFrame) -> None:
         else:
             st.caption("No usable timestamps, so only the simple average of records is available.")
 
+        st.markdown("##### Time spent in each weight range")
+        bands = weight_band_durations(weighted, "weight", "record_dt", bin_size=5.0) if weight_has_time else pd.DataFrame()
+        if not bands.empty:
+            bands = bands.assign(share=bands["days"] / bands["days"].sum() * 100)
+            band_chart, band_table = st.columns([1.4, 1])
+            with band_chart:
+                fig = go.Figure(
+                    data=[
+                        go.Bar(
+                            x=bands["days"],
+                            y=bands["band_label"],
+                            orientation="h",
+                            marker_color="#2563eb",
+                            customdata=bands["share"],
+                            hovertemplate="%{y}<br>Time: %{x:.1f} days (%{customdata:.1f}%)<extra></extra>",
+                        )
+                    ]
+                )
+                fig.update_layout(
+                    height=max(240, 60 + len(bands) * 46),
+                    margin=dict(l=12, r=12, t=10, b=42),
+                    xaxis_title="Days",
+                    yaxis_title="Weight range",
+                    plot_bgcolor="#ffffff",
+                    paper_bgcolor="#ffffff",
+                )
+                fig.update_yaxes(categoryorder="array", categoryarray=list(bands["band_label"]))
+                apply_chart_theme(fig)
+                st.plotly_chart(fig, width="stretch")
+            with band_table:
+                band_display = pd.DataFrame(
+                    {
+                        "Weight range": bands["band_label"],
+                        "Days": bands["days"].map(lambda value: f"{value:,.1f}"),
+                        "Share": bands["share"].map(lambda value: f"{value:.1f}%"),
+                        "Cumulative %": bands["share"].cumsum().map(lambda value: f"{value:.1f}%"),
+                    }
+                )
+                st.dataframe(band_display, width="stretch", hide_index=True)
+            st.caption(
+                "Time between consecutive weigh-ins is credited to the 5 kg band holding that "
+                "interval's midpoint weight, then summed per band. Cumulative % is the share of "
+                "time spent at or below each band."
+            )
+        elif weight_has_time:
+            st.caption("Need at least two timestamped weigh-ins to total time per weight range.")
+        else:
+            st.caption("No usable timestamps, so time spent in each weight range can't be computed.")
+
+        st.markdown("##### Body weight range over time")
+        if weight_has_time:
+            range_grain = st.radio(
+                "Range period",
+                ["Month", "Year"],
+                horizontal=True,
+                key="weight_range_period",
+            )
+            ranges = weight_range_by_period(
+                filter_by_date(weighted, "record_dt", body_window),
+                "weight",
+                "record_dt",
+                freq="M" if range_grain == "Month" else "Y",
+            )
+        else:
+            range_grain = "Month"
+            ranges = pd.DataFrame()
+
+        if not ranges.empty:
+            tick_format = "%Y-%m" if range_grain == "Month" else "%Y"
+            ranges = ranges.assign(spread=ranges["high"] - ranges["low"])
+            fig = go.Figure()
+            fig.add_trace(
+                go.Bar(
+                    x=ranges["period_start"],
+                    y=ranges["spread"],
+                    base=ranges["low"],
+                    name="Range",
+                    marker_color="#bfdbfe",
+                    marker_line_color="#2563eb",
+                    marker_line_width=1,
+                    customdata=ranges[["low", "high", "mean", "spread"]],
+                    hovertemplate=(
+                        f"{range_grain}: %{{x|{tick_format}}}<br>"
+                        "Low: %{customdata[0]:.1f} kg<br>"
+                        "High: %{customdata[1]:.1f} kg<br>"
+                        "Average: %{customdata[2]:.1f} kg<br>"
+                        "Spread: %{customdata[3]:.1f} kg"
+                        "<extra></extra>"
+                    ),
+                )
+            )
+            fig.add_trace(
+                go.Scatter(
+                    x=ranges["period_start"],
+                    y=ranges["mean"],
+                    mode="lines+markers",
+                    name="Average",
+                    line=dict(color="#1d4ed8", width=2),
+                    marker=dict(size=6),
+                    hovertemplate=f"{range_grain}: %{{x|{tick_format}}}<br>Average: %{{y:.1f}} kg<extra></extra>",
+                )
+            )
+            fig.update_layout(
+                height=380,
+                margin=dict(l=12, r=12, t=10, b=42),
+                xaxis_title=range_grain,
+                yaxis_title="Weight (kg)",
+                legend_title=None,
+                barmode="overlay",
+                plot_bgcolor="#ffffff",
+                paper_bgcolor="#ffffff",
+            )
+            fig.update_xaxes(type="date")
+            apply_chart_theme(fig)
+            st.plotly_chart(fig, width="stretch")
+            st.caption(
+                f"Each bar spans the lowest-to-highest weight recorded in that {range_grain.lower()}; "
+                "the line tracks the period average."
+            )
+        elif weight_has_time:
+            st.caption("Need timestamped weigh-ins to show the weight range over time.")
+        else:
+            st.caption("No usable timestamps, so the weight range over time can't be computed.")
+
+        st.markdown("##### Estimate future weight")
+        proj_basis_days = {"Week": 7, "Month": 30}
+        proj_horizons = {"1 month": 30, "3 months": 90, "6 months": 180, "1 year": 365}
+        proj_colors = {"Week": "#f59e0b", "Month": "#16a34a"}
+        forecast_source = (
+            weighted.dropna(subset=["record_dt"]).sort_values("record_dt", kind="stable")
+            if weight_has_time
+            else pd.DataFrame()
+        )
+
+        if len(forecast_source) >= 2:
+            selected_bases = st.multiselect(
+                "Continue the trend from the past…",
+                list(proj_basis_days.keys()),
+                default=list(proj_basis_days.keys()),
+                key="weight_projection_bases",
+            )
+            horizon_label = st.radio(
+                "Project ahead",
+                list(proj_horizons.keys()),
+                horizontal=True,
+                index=1,
+                key="weight_projection_horizon",
+            )
+            horizon_days = proj_horizons[horizon_label]
+
+            anchor_time = forecast_source["record_dt"].iloc[-1]
+            anchor_value = float(forecast_source["weight"].iloc[-1])
+            target_time = anchor_time + pd.Timedelta(days=horizon_days)
+
+            forecasts = []
+            missing = []
+            for basis in selected_bases:
+                window_days = proj_basis_days[basis]
+                rate = trailing_rate_per_day(
+                    forecast_source,
+                    "weight",
+                    "record_dt",
+                    window_days=window_days,
+                    min_span_days=window_days * 0.5,
+                )
+                if rate is None:
+                    missing.append(basis)
+                    continue
+                forecasts.append((basis, rate, anchor_value + rate * horizon_days))
+
+            if forecasts:
+                metric_cols = st.columns(len(forecasts))
+                for col, (basis, rate, target_value) in zip(metric_cols, forecasts):
+                    col.metric(
+                        f"If past {basis.lower()}'s trend holds",
+                        f"{target_value:.1f} kg",
+                        delta=f"{target_value - anchor_value:+.1f} kg in {horizon_label}",
+                        delta_color="off",
+                    )
+
+            fig = go.Figure()
+            fig.add_trace(
+                go.Scatter(
+                    x=forecast_source["record_dt"],
+                    y=forecast_source["weight"],
+                    mode="lines+markers",
+                    name="Recorded",
+                    line=dict(color="#2563eb", width=2),
+                    marker=dict(size=6),
+                    hovertemplate="Date: %{x|%Y-%m-%d}<br>Weight: %{y:.1f} kg<extra></extra>",
+                )
+            )
+            for basis, rate, target_value in forecasts:
+                fig.add_trace(
+                    go.Scatter(
+                        x=[anchor_time, target_time],
+                        y=[anchor_value, target_value],
+                        mode="lines",
+                        name=f"Past {basis.lower()} trend",
+                        line=dict(color=proj_colors.get(basis, "#64748b"), width=2, dash="dash"),
+                        hovertemplate="%{x|%Y-%m-%d}<br>Projected: %{y:.1f} kg<extra></extra>",
+                    )
+                )
+            fig.update_layout(
+                height=380,
+                margin=dict(l=12, r=12, t=10, b=42),
+                xaxis_title="Date",
+                yaxis_title="Weight (kg)",
+                legend_title=None,
+                plot_bgcolor="#ffffff",
+                paper_bgcolor="#ffffff",
+            )
+            fig.update_xaxes(type="date")
+            apply_chart_theme(fig)
+            st.plotly_chart(fig, width="stretch")
+
+            if missing:
+                st.caption(
+                    "Not enough weigh-ins in the past "
+                    + " or ".join(basis.lower() for basis in missing)
+                    + " to estimate that trend."
+                )
+            st.caption(
+                "Projections continue the average kg-per-day change measured across the past "
+                "week/month in a straight line from your latest weigh-in. It assumes the trend "
+                "holds unchanged — a simple extrapolation, not a medical prediction."
+            )
+        elif weight_has_time:
+            st.caption("Need at least two timestamped weigh-ins to project future weight.")
+        else:
+            st.caption("No usable timestamps, so future weight can't be projected.")
+
     if selected_metrics:
         has_record_time = has_usable_time(body, "record_dt")
         if has_record_time:
@@ -473,7 +869,7 @@ def render_body_tab(body: pd.DataFrame) -> None:
                 horizontal=True,
                 key="body_time_grain",
             )
-            chart_data = body.dropna(subset=["record_dt"]).copy()
+            chart_data = filter_by_date(body, "record_dt", body_window).dropna(subset=["record_dt"]).copy()
             chart_data["time_bucket"] = time_bucket(chart_data["record_dt"], time_grain)
             chart_data = (
                 chart_data.groupby("time_bucket", as_index=False)[selected_metrics]
@@ -487,6 +883,11 @@ def render_body_tab(body: pd.DataFrame) -> None:
             x_values = chart_data["record_index"]
             x_title = "Record number"
 
+        if has_record_time:
+            x_hover = f"{x_title}: %{{x|%Y-%m-%d}}<br>"
+        else:
+            x_hover = f"{x_title}: %{{x}}<br>"
+
         fig = go.Figure()
         for metric in selected_metrics:
             fig.add_trace(
@@ -498,7 +899,7 @@ def render_body_tab(body: pd.DataFrame) -> None:
                     line=dict(width=2),
                     marker=dict(size=7),
                     connectgaps=False,
-                    hovertemplate=f"{metric_label(metric)}: %{{y:.2f}}<extra></extra>",
+                    hovertemplate=f"{x_hover}{metric_label(metric)}: %{{y:.2f}}<extra></extra>",
                 )
             )
         fig.update_layout(

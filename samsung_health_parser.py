@@ -107,8 +107,8 @@ def prepare_sleep_stages(frame: pd.DataFrame) -> pd.DataFrame:
         work["sleep_id"] = work.get("source_name", pd.Series("Sleep session", index=work.index))
     work["sleep_id"] = work["sleep_id"].fillna("Sleep session").astype(str)
 
-    work["start_dt"] = parse_datetime_series(work.get("start_time"))
-    work["end_dt"] = parse_datetime_series(work.get("end_time"))
+    work["start_dt"] = parse_datetime_series(work.get("start_time"), work.get("time_offset"))
+    work["end_dt"] = parse_datetime_series(work.get("end_time"), work.get("time_offset"))
     work["has_absolute_time"] = work["start_dt"].notna() & work["end_dt"].notna()
 
     work["start_fragment_min"] = work.get("start_time", pd.Series(pd.NA, index=work.index)).map(
@@ -153,8 +153,8 @@ def prepare_sleep_stages(frame: pd.DataFrame) -> pd.DataFrame:
             work.loc[group.index, "x_start_min"] = group["duration_min"].cumsum() - group["duration_min"]
 
     work["x_end_min"] = work["x_start_min"] + work["duration_min"]
-    work["hover_start"] = _format_time_value(work.get("start_time"))
-    work["hover_end"] = _format_time_value(work.get("end_time"))
+    work["hover_start"] = _format_datetime_or_time_value(work["start_dt"], work.get("start_time"))
+    work["hover_end"] = _format_datetime_or_time_value(work["end_dt"], work.get("end_time"))
     return work.reset_index(drop=True)
 
 
@@ -185,6 +185,70 @@ def summarize_sleep_sessions(sleep: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def daily_sleep_summary(sleep: pd.DataFrame) -> pd.DataFrame:
+    """One row per sleep session: sleep-in time, wake-up time and total sleep.
+
+    Groups sleep-stage rows by session and reports when sleep began (sleep-in),
+    when it ended (wake-up) and the total recorded time from sleep-in to wake-up.
+    Clock times and the calendar date are filled only for sessions whose source
+    has absolute timestamps; ``has_clock_time`` flags those. Sleep length is
+    always available because it comes from the stage durations. The date is the
+    day sleep began and rows are sorted by sleep-in time when timestamps exist.
+    Columns: ``sleep_id``, ``session_label``, ``date``, ``sleep_in_dt``,
+    ``wake_up_dt``, ``sleep_in``, ``wake_up``, ``sleep_minutes``,
+    ``has_clock_time``.
+    """
+    columns = [
+        "sleep_id",
+        "session_label",
+        "date",
+        "sleep_in_dt",
+        "wake_up_dt",
+        "sleep_in",
+        "wake_up",
+        "sleep_minutes",
+        "has_clock_time",
+    ]
+    if sleep.empty:
+        return pd.DataFrame(columns=columns)
+
+    rows = []
+    for _, group in sleep.groupby("sleep_id", sort=False):
+        has_clock_time = bool(group["has_absolute_time"].all() and group["start_dt"].notna().any())
+        if has_clock_time:
+            sleep_in_dt = group["start_dt"].min()
+            wake_up_dt = group["end_dt"].max()
+            sleep_in = sleep_in_dt.strftime("%H:%M")
+            wake_up = wake_up_dt.strftime("%H:%M")
+            date = sleep_in_dt.normalize()
+        else:
+            sleep_in_dt = pd.NaT
+            wake_up_dt = pd.NaT
+            sleep_in = ""
+            wake_up = ""
+            date = pd.NaT
+        rows.append(
+            {
+                "sleep_id": group["sleep_id"].iloc[0],
+                "session_label": group["session_label"].iloc[0],
+                "date": date,
+                "sleep_in_dt": sleep_in_dt,
+                "wake_up_dt": wake_up_dt,
+                "sleep_in": sleep_in,
+                "wake_up": wake_up,
+                "sleep_minutes": float(group["duration_min"].sum()),
+                "has_clock_time": has_clock_time,
+            }
+        )
+
+    result = pd.DataFrame(rows, columns=columns)
+    for column in ["date", "sleep_in_dt", "wake_up_dt"]:
+        result[column] = pd.to_datetime(result[column], errors="coerce")
+    if result["sleep_in_dt"].notna().any():
+        result = result.sort_values("sleep_in_dt", kind="stable").reset_index(drop=True)
+    return result
+
+
 def prepare_sleep_records(frame: pd.DataFrame) -> pd.DataFrame:
     if frame.empty or "start_time" not in frame.columns or "end_time" not in frame.columns:
         return pd.DataFrame()
@@ -207,8 +271,8 @@ def prepare_sleep_records(frame: pd.DataFrame) -> pd.DataFrame:
     missing_id = work["sleep_id"].eq("") | work["sleep_id"].str.lower().eq("<na>")
     work["sleep_id"] = work["sleep_id"].mask(missing_id, fallback_id)
 
-    work["start_dt"] = parse_datetime_series(work["start_time"])
-    work["end_dt"] = parse_datetime_series(work["end_time"])
+    work["start_dt"] = parse_datetime_series(work["start_time"], work.get("time_offset"))
+    work["end_dt"] = parse_datetime_series(work["end_time"], work.get("time_offset"))
     work["has_absolute_time"] = work["start_dt"].notna() & work["end_dt"].notna()
 
     work["start_fragment_min"] = work["start_time"].map(_clock_fragment_minutes)
@@ -233,8 +297,8 @@ def prepare_sleep_records(frame: pd.DataFrame) -> pd.DataFrame:
     work = work.sort_values(sort_columns, kind="stable")
     work["session_number"] = range(1, len(work) + 1)
     work["session_label"] = work["session_number"].map(lambda value: f"Session {value}")
-    work["hover_start"] = _format_time_value(work.get("start_time"))
-    work["hover_end"] = _format_time_value(work.get("end_time"))
+    work["hover_start"] = _format_datetime_or_time_value(work["start_dt"], work.get("start_time"))
+    work["hover_end"] = _format_datetime_or_time_value(work["end_dt"], work.get("end_time"))
     return work.reset_index(drop=True)
 
 
@@ -258,7 +322,7 @@ def prepare_body_records(frame: pd.DataFrame) -> pd.DataFrame:
         return work
 
     time_column = "start_time" if "start_time" in work.columns else "create_time" if "create_time" in work.columns else None
-    work["record_dt"] = parse_datetime_series(work[time_column]) if time_column else pd.NaT
+    work["record_dt"] = parse_datetime_series(work[time_column], work.get("time_offset")) if time_column else pd.NaT
     work["_row_order"] = range(len(work))
     if work["record_dt"].notna().any():
         work = work.sort_values(["record_dt", "_row_order"], kind="stable")
@@ -281,25 +345,56 @@ def metric_label(column: str) -> str:
     return f"{config['label']} ({unit})" if unit else config["label"]
 
 
-def parse_datetime_series(series: pd.Series | None) -> pd.Series:
+def parse_datetime_series(series: pd.Series | None, time_offset_series: pd.Series | None = None) -> pd.Series:
     if series is None:
         return pd.Series(dtype="datetime64[ns]")
 
     values = series.astype("string").str.strip()
     parsed = pd.Series(pd.NaT, index=series.index, dtype="datetime64[ns]")
+    time_offsets = _time_offset_minutes_series(time_offset_series, series.index)
 
     numeric = pd.to_numeric(values, errors="coerce")
     numeric_mask = numeric.notna() & values.str.fullmatch(r"-?\d+(\.\d+)?").fillna(False)
     if numeric_mask.any():
         median = numeric[numeric_mask].abs().median()
+        parsed_utc = None
         if median > 1e11:
-            parsed.loc[numeric_mask] = pd.to_datetime(numeric[numeric_mask], unit="ms", errors="coerce")
+            parsed_utc = pd.to_datetime(numeric[numeric_mask], unit="ms", errors="coerce", utc=True)
         elif median > 1e9:
-            parsed.loc[numeric_mask] = pd.to_datetime(numeric[numeric_mask], unit="s", errors="coerce")
+            parsed_utc = pd.to_datetime(numeric[numeric_mask], unit="s", errors="coerce", utc=True)
+        if parsed_utc is not None:
+            parsed.loc[numeric_mask] = _utc_to_local_naive(parsed_utc, time_offsets.loc[numeric_mask])
 
     text_mask = values.notna() & values.map(_looks_date_like)
     if text_mask.any():
-        parsed.loc[text_mask] = pd.to_datetime(values[text_mask], errors="coerce")
+        text_values = values[text_mask]
+        explicit_tz_mask = text_values.map(_has_explicit_timezone).fillna(False)
+        naive_text_mask = ~explicit_tz_mask
+        if naive_text_mask.any():
+            naive_values = text_values[naive_text_mask]
+            naive_offsets = time_offsets.loc[naive_values.index]
+            # Samsung Health writes start_time/end_time as UTC wall-clock strings
+            # with no tz suffix and records the real offset separately in
+            # time_offset. When that offset is known, read the string as UTC and
+            # shift it to local time; with no offset, keep it exactly as written.
+            offset_known = naive_offsets.notna()
+            if offset_known.any():
+                utc_values = naive_values[offset_known]
+                parsed_utc = pd.to_datetime(utc_values, errors="coerce", utc=True)
+                parsed.loc[utc_values.index] = _utc_to_local_naive(
+                    parsed_utc, naive_offsets.loc[utc_values.index]
+                )
+            plain_mask = ~offset_known
+            if plain_mask.any():
+                plain_values = naive_values[plain_mask]
+                parsed.loc[plain_values.index] = pd.to_datetime(plain_values, errors="coerce")
+        if explicit_tz_mask.any():
+            explicit_values = text_values[explicit_tz_mask]
+            parsed_utc = pd.to_datetime(explicit_values, errors="coerce", utc=True)
+            explicit_offsets = time_offsets.loc[explicit_values.index].fillna(
+                explicit_values.map(_parse_time_offset_minutes)
+            )
+            parsed.loc[explicit_values.index] = _utc_to_local_naive(parsed_utc, explicit_offsets)
 
     return parsed
 
@@ -348,6 +443,140 @@ def time_weighted_mean(
 
     integrate = np.trapezoid if hasattr(np, "trapezoid") else np.trapz
     return float(integrate(value_array, seconds) / total)
+
+
+def weight_band_durations(
+    frame: pd.DataFrame,
+    value_column: str = "weight",
+    time_column: str = "record_dt",
+    bin_size: float = 5.0,
+) -> pd.DataFrame:
+    """Time spent within each fixed-width weight band.
+
+    Each consecutive pair of measurements forms an interval whose elapsed time is
+    credited to the band holding the interval's midpoint weight (e.g. with a 5 kg
+    bin, a midpoint of 82 kg lands in the 80-85 kg band). Durations are summed per
+    band and reported in days. Returns an empty frame when fewer than two usable
+    timestamped measurements exist. Columns: ``band_low``, ``band_high``,
+    ``band_label``, ``days``.
+    """
+    columns = ["band_low", "band_high", "band_label", "days"]
+    if frame.empty or value_column not in frame.columns or bin_size <= 0:
+        return pd.DataFrame(columns=columns)
+
+    work = (
+        pd.DataFrame(
+            {
+                "value": pd.to_numeric(frame[value_column], errors="coerce"),
+                "time": pd.to_datetime(frame.get(time_column), errors="coerce"),
+            }
+        )
+        .dropna()
+        .sort_values("time", kind="stable")
+    )
+    if len(work) < 2:
+        return pd.DataFrame(columns=columns)
+
+    values = work["value"].to_numpy(dtype="float64")
+    seconds = (work["time"] - work["time"].iloc[0]).dt.total_seconds().to_numpy()
+    midpoints = (values[:-1] + values[1:]) / 2
+    band_low = np.floor(midpoints / bin_size) * bin_size
+
+    grouped = (
+        pd.DataFrame({"band_low": band_low, "days": np.diff(seconds) / 86400})
+        .groupby("band_low", as_index=False)["days"]
+        .sum()
+        .sort_values("band_low", kind="stable")
+    )
+    grouped = grouped[grouped["days"] > 0].reset_index(drop=True)
+    grouped["band_high"] = grouped["band_low"] + bin_size
+    grouped["band_label"] = [f"{low:.0f}-{low + bin_size:.0f} kg" for low in grouped["band_low"]]
+    return grouped[columns]
+
+
+def weight_range_by_period(
+    frame: pd.DataFrame,
+    value_column: str = "weight",
+    time_column: str = "record_dt",
+    freq: str = "M",
+) -> pd.DataFrame:
+    """Lowest, highest and mean of a metric within each calendar period.
+
+    Buckets measurements by ``freq`` (a pandas period alias such as ``"M"`` for
+    month or ``"Y"`` for year) and returns one row per period that has data, sorted
+    by time. Columns: ``period_start``, ``low``, ``high``, ``mean``, ``count``.
+    Empty when no usable timestamped measurements exist.
+    """
+    columns = ["period_start", "low", "high", "mean", "count"]
+    if frame.empty or value_column not in frame.columns:
+        return pd.DataFrame(columns=columns)
+
+    work = pd.DataFrame(
+        {
+            "value": pd.to_numeric(frame[value_column], errors="coerce"),
+            "time": pd.to_datetime(frame.get(time_column), errors="coerce"),
+        }
+    ).dropna()
+    if work.empty:
+        return pd.DataFrame(columns=columns)
+
+    work["period_start"] = work["time"].dt.to_period(freq).dt.start_time
+    grouped = (
+        work.groupby("period_start", as_index=False)
+        .agg(
+            low=("value", "min"),
+            high=("value", "max"),
+            mean=("value", "mean"),
+            count=("value", "size"),
+        )
+        .sort_values("period_start", kind="stable")
+        .reset_index(drop=True)
+    )
+    return grouped[columns]
+
+
+def trailing_rate_per_day(
+    frame: pd.DataFrame,
+    value_column: str = "weight",
+    time_column: str = "record_dt",
+    window_days: float = 30.0,
+    min_span_days: float = 0.0,
+) -> float | None:
+    """Average change per day across the most recent ``window_days`` of records.
+
+    Looks only at measurements whose timestamp falls within ``window_days`` before
+    the latest record, then returns ``(last_value - first_value) / days_between``
+    for that window — the recent "difference per time" used to extrapolate a trend.
+    Returns ``None`` when the window holds fewer than two measurements, spans no
+    time, or spans less than ``min_span_days`` (a guard against treating a couple of
+    closely-spaced weigh-ins as representative of the whole period).
+    """
+    if frame.empty or value_column not in frame.columns or window_days <= 0:
+        return None
+
+    work = (
+        pd.DataFrame(
+            {
+                "value": pd.to_numeric(frame[value_column], errors="coerce"),
+                "time": pd.to_datetime(frame.get(time_column), errors="coerce"),
+            }
+        )
+        .dropna()
+        .sort_values("time", kind="stable")
+    )
+    if len(work) < 2:
+        return None
+
+    window_start = work["time"].iloc[-1] - pd.Timedelta(days=window_days)
+    window = work[work["time"] >= window_start]
+    if len(window) < 2:
+        return None
+
+    span_days = (window["time"].iloc[-1] - window["time"].iloc[0]).total_seconds() / 86400
+    if span_days <= 0 or span_days < min_span_days:
+        return None
+
+    return float((window["value"].iloc[-1] - window["value"].iloc[0]) / span_days)
 
 
 def _read_bytes(source: str | Path | bytes | BinaryIO) -> bytes:
@@ -487,6 +716,50 @@ def _looks_date_like(value: object) -> bool:
     )
 
 
+def _time_offset_minutes_series(series: pd.Series | None, index: pd.Index) -> pd.Series:
+    if series is None:
+        return pd.Series(np.nan, index=index, dtype="float64")
+    return series.reindex(index).map(_parse_time_offset_minutes).astype("float64")
+
+
+def _parse_time_offset_minutes(value: object) -> float | None:
+    if pd.isna(value):
+        return None
+    text = str(value).strip().upper()
+    if not text:
+        return None
+    if text in {"Z", "UTC", "GMT"} or (text.endswith("Z") and "T" in text):
+        return 0.0
+
+    patterns = [
+        r"^(?:UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))?$",
+        r"^([+-])\s*(\d{1,2})(?::?(\d{2}))?$",
+        r"(?:UTC|GMT)\s*([+-])\s*(\d{1,2})(?::?(\d{2}))\s*$",
+        r"[T\s]\d{1,2}:\d{2}(?::\d{2}(?:\.\d+)?)?\s*([+-])(\d{2})(?::?(\d{2}))\s*$",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if not match:
+            continue
+        sign_text, hours_text, minutes_text = match.groups()
+        hours = int(hours_text)
+        minutes = int(minutes_text or 0)
+        if hours > 14 or minutes >= 60:
+            return None
+        sign = 1 if sign_text == "+" else -1
+        return float(sign * (hours * 60 + minutes))
+    return None
+
+
+def _has_explicit_timezone(value: object) -> bool:
+    return _parse_time_offset_minutes(value) is not None
+
+
+def _utc_to_local_naive(parsed_utc: pd.Series, offsets: pd.Series) -> pd.Series:
+    adjusted = parsed_utc + pd.to_timedelta(offsets.fillna(0), unit="m")
+    return adjusted.dt.tz_localize(None)
+
+
 def _clock_fragment_minutes(value: object) -> float | None:
     if pd.isna(value):
         return None
@@ -524,3 +797,9 @@ def _format_time_value(series: pd.Series | None) -> pd.Series:
     if series is None:
         return pd.Series(dtype="string")
     return series.astype("string").fillna("")
+
+
+def _format_datetime_or_time_value(datetime_series: pd.Series, fallback_series: pd.Series | None) -> pd.Series:
+    formatted = datetime_series.dt.strftime("%Y-%m-%d %H:%M")
+    fallback = _format_time_value(fallback_series).reindex(datetime_series.index).fillna("")
+    return formatted.fillna(fallback).astype("string")
